@@ -1,43 +1,77 @@
 <template>
-  <div>
+  <div v-loading="loading" element-loading-background="rgba(255,255,255,0.45)">
     <div class="eq-panel">
       <div class="eq-panel__head">
         <h2>马房栏位分布</h2>
-        <el-button type="primary" @click="stallDialog = true">新增栏位</el-button>
+        <div class="board__actions">
+          <span v-if="loadedAt" class="eq-muted">
+            最近刷新 {{ loadedAtLabel }}
+          </span>
+          <el-button :loading="loading" @click="refresh()">刷新</el-button>
+          <el-button type="primary" @click="stallDialog = true">新增栏位</el-button>
+        </div>
       </div>
+
+      <!-- 请求失败：保留上一次可信结果，明确提示；下一次成功加载后提示消失，不留任何旧统计缓存 -->
+      <el-alert
+        v-if="loadError"
+        class="board__alert"
+        type="error"
+        show-icon
+        :closable="false"
+        :title="loadError"
+      >
+        <div class="board__alert__foot">
+          <span>当前展示的是最近一次成功加载的数据，请稍后重试。</span>
+          <el-button size="small" type="danger" plain :loading="loading" @click="refresh()">
+            重新加载
+          </el-button>
+        </div>
+      </el-alert>
+
+      <div v-if="horseWarning" class="board__warn eq-muted">马匹列表暂未更新：{{ horseWarning }}，入栏可选马匹仍为最近一次成功加载的结果。</div>
 
       <div class="summary">
         <div class="summary__item">
-          <span class="summary__num">{{ stalls.length }}</span>
+          <span class="summary__num">{{ summary.total }}</span>
           <span class="summary__label">栏位总数</span>
         </div>
         <div class="summary__item summary__item--idle">
-          <span class="summary__num">{{ countOf('IDLE') }}</span>
+          <span class="summary__num">{{ summary.idle }}</span>
           <span class="summary__label">空闲</span>
         </div>
         <div class="summary__item summary__item--occupied">
-          <span class="summary__num">{{ countOf('OCCUPIED') }}</span>
+          <span class="summary__num">{{ summary.occupied }}</span>
           <span class="summary__label">占用</span>
         </div>
         <div class="summary__item summary__item--maintenance">
-          <span class="summary__num">{{ countOf('MAINTENANCE') }}</span>
+          <span class="summary__num">{{ summary.maintenance }}</span>
           <span class="summary__label">维护中</span>
         </div>
         <div class="summary__tip">
-          规则：栏位编号唯一 · 一个栏位只放一匹马 · 一匹马只占一个栏位 · 维护中禁止入栏
+          规则：栏位编号唯一 · 一个栏位只放一匹马 · 一匹马只占一个栏位 · 维护中禁止入栏<br />
+          顶部汇总、马房分组与卡片信息由同一次栏位明细计算，同轮切换。
         </div>
       </div>
     </div>
 
-    <div v-for="barn in barns" :key="barn" class="eq-panel barn">
+    <el-empty
+      v-if="!loading && !loadError && groups.length === 0"
+      class="board__empty"
+      description="暂无栏位，点击右上角「新增栏位」创建"
+    />
+
+    <div v-for="group in groups" :key="group.barn" class="eq-panel barn">
       <div class="eq-panel__head">
-        <h2>{{ barn }}</h2>
-        <span>{{ byBarn(barn).length }} 个栏位 · 已用 {{ byBarn(barn).filter((s) => s.horseId).length }} 个</span>
+        <h2>{{ group.barn }}</h2>
+        <span>
+          {{ group.total }} 个栏位 · 空闲 {{ group.idle }} · 已用 {{ group.occupied }} · 维护 {{ group.maintenance }}
+        </span>
       </div>
 
       <div class="stalls">
         <div
-          v-for="stall in byBarn(barn)"
+          v-for="stall in group.stalls"
           :key="stall.id"
           class="stall"
           :class="'stall--' + stall.status.toLowerCase()"
@@ -118,8 +152,19 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import api from '../api'
 
+const KNOWN_STATUS = ['IDLE', 'OCCUPIED', 'MAINTENANCE']
+const STATUS_NAME = { IDLE: '空闲', OCCUPIED: '占用', MAINTENANCE: '维护中' }
+const UNGROUPED_BARN = '未分组马房'
+
+// 页面状态：stalls 是看板唯一的明细来源，顶部汇总 / 马房分组 / 卡片全部由它派生
 const stalls = ref([])
+// 入栏下拉用的马匹档案，来自独立接口；它失败不能影响栏位看板本身
 const horses = ref([])
+const loading = ref(false)
+const loadError = ref('')
+const horseWarning = ref('')
+const loadedAt = ref(null)
+
 const saving = ref(false)
 const stallDialog = ref(false)
 const occupyDialog = ref(false)
@@ -127,35 +172,198 @@ const occupyDialog = ref(false)
 const stallForm = reactive({ stallNo: '', barnName: '', areaSqm: null })
 const occupyForm = reactive({ id: null, stallNo: '', barnName: '', horseId: null })
 
-const barns = computed(() => [...new Set(stalls.value.map((stall) => stall.barnName))])
+// 过期响应防护：手动刷新与操作后自动刷新可能并发，只有最后一轮请求能写状态
+let loadSeq = 0
 
-function byBarn(barn) {
-  return stalls.value.filter((stall) => stall.barnName === barn)
+function isObject(value) {
+  return value !== null && typeof value === 'object'
 }
 
-function countOf(status) {
-  return stalls.value.filter((stall) => stall.status === status).length
+function textOf(value, fallback) {
+  if (typeof value === 'number') return String(value)
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed === '' ? fallback : trimmed
+  }
+  return fallback
 }
 
-function tagOf(status) {
-  if (status === 'IDLE') return 'success'
-  if (status === 'OCCUPIED') return 'primary'
-  return 'warning'
+/**
+ * 规范化栏位明细：
+ *  - 只接受带 id 的对象，按 id 去重，返回顺序变化也不会出现重复卡片 / 重复计数
+ *  - 状态只认 IDLE / OCCUPIED / MAINTENANCE，异常值按空闲兜底，保证三个计数恒等于总数
+ *  - 空马房归入「未分组马房」、空面积保留 null 走「面积未登记」
+ *  - 卡片上的马匹信息只认这一批明细里的 horseId / horseName / horseNo
+ */
+function normalizeStalls(list) {
+  if (!Array.isArray(list)) return []
+  const map = new Map()
+  for (const item of list) {
+    if (!isObject(item)) continue
+    const id = Number(item.id)
+    if (!Number.isFinite(id) || map.has(id)) continue
+    const rawStatus = textOf(item.status, 'IDLE')
+    const status = KNOWN_STATUS.includes(rawStatus) ? rawStatus : 'IDLE'
+    const rawHorseId = item.horseId === null || item.horseId === undefined || item.horseId === ''
+      ? null
+      : Number(item.horseId)
+    const hasArea = item.areaSqm !== null && item.areaSqm !== undefined && item.areaSqm !== ''
+      && Number.isFinite(Number(item.areaSqm))
+    map.set(id, {
+      id,
+      stallNo: textOf(item.stallNo, `#${id}`),
+      barnName: textOf(item.barnName, UNGROUPED_BARN),
+      areaSqm: hasArea ? Number(item.areaSqm) : null,
+      status,
+      // 后端已知状态会给中文名；异常状态统一显示兜底中文名
+      statusName: STATUS_NAME[status],
+      horseId: Number.isFinite(rawHorseId) ? rawHorseId : null,
+      horseNo: textOf(item.horseNo, '编号缺失'),
+      horseName: textOf(item.horseName, '马匹档案缺失')
+    })
+  }
+  // 顺序以 id 为准稳定排序，后端返回顺序变化不影响分组与卡片
+  return [...map.values()].sort((a, b) => a.id - b.id)
 }
 
-async function load() {
+function normalizeHorses(list) {
+  if (!Array.isArray(list)) return []
+  const map = new Map()
+  for (const item of list) {
+    if (!isObject(item)) continue
+    const id = Number(item.id)
+    if (!Number.isFinite(id) || map.has(id)) continue
+    map.set(id, {
+      id,
+      horseNo: textOf(item.horseNo, `#${id}`),
+      name: textOf(item.name, '未命名马匹'),
+      statusName: textOf(item.statusName, '')
+    })
+  }
+  return [...map.values()].sort((a, b) => a.id - b.id)
+}
+
+function emptySummary() {
+  return { total: 0, idle: 0, occupied: 0, maintenance: 0 }
+}
+
+/**
+ * 同一份快照同时产出「顶部汇总」和「马房分组」，
+ * 任何数字都可以从 groups[].stalls 追溯到具体栏位卡片。
+ */
+const groups = computed(() => {
+  const map = new Map()
+  for (const stall of stalls.value) {
+    let group = map.get(stall.barnName)
+    if (!group) {
+      group = { barn: stall.barnName, stalls: [], ...emptySummary() }
+      map.set(stall.barnName, group)
+    }
+    group.stalls.push(stall)
+    group.total += 1
+    if (stall.status === 'OCCUPIED') {
+      group.occupied += 1
+    } else if (stall.status === 'MAINTENANCE') {
+      group.maintenance += 1
+    } else {
+      group.idle += 1
+    }
+  }
+  // 马房顺序按本批数据首次出现顺序（normalizeStalls 已按 id 稳定排序）
+  return [...map.values()]
+})
+
+const summary = computed(() => {
+  const total = emptySummary()
+  for (const group of groups.value) {
+    total.total += group.total
+    total.idle += group.idle
+    total.occupied += group.occupied
+    total.maintenance += group.maintenance
+  }
+  return total
+})
+
+const loadedAtLabel = computed(() => {
+  if (!loadedAt.value) return ''
+  const pad = (n) => String(n).padStart(2, '0')
+  const t = loadedAt.value
+  return `${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`
+})
+
+function reasonOf(error, fallback) {
+  return error && error.message ? error.message : fallback
+}
+
+/**
+ * 拉取看板数据。
+ * 口径：栏位明细是看板的唯一来源；马匹下拉独立处理。
+ *  - 栏位接口失败：保留上一次成功结果并报错，绝不用空数组覆盖（首次进入则为空态 + 错误条）
+ *  - 马匹接口失败：不影响栏位统计与卡片，只在顶部弱化提示，下拉保留旧列表
+ *  - 只有两个结果都到手并经过规范化后，stalls / horses 才在同一轮同步赋值，
+ *    顶部汇总、分组、卡片在同一次渲染中切换，不会短暂出现互相矛盾的数字
+ *  - 用 loadSeq 丢弃过期响应，快速连续刷新也不会被旧响应回写
+ */
+async function load({ manual = false } = {}) {
+  const seq = ++loadSeq
+  loading.value = true
   try {
-    const [stallList, horseList] = await Promise.all([api.stalls(), api.horses()])
-    stalls.value = stallList || []
-    horses.value = horseList || []
+    const [stallResult, horseResult] = await Promise.allSettled([api.stalls(), api.horses()])
+    if (seq !== loadSeq) return
+
+    if (stallResult.status === 'rejected') {
+      loadError.value = '栏位看板加载失败：' + reasonOf(stallResult.reason, '网络异常，请稍后重试')
+      if (manual) ElMessage.error(loadError.value)
+      if (horseResult.status === 'fulfilled') {
+        horses.value = normalizeHorses(horseResult.value)
+        horseWarning.value = ''
+      } else {
+        horseWarning.value = reasonOf(horseResult.reason, '网络异常，请稍后重试')
+      }
+      return false
+    }
+
+    // 同轮数据：先规范化，再一次性同步替换，保证汇总 / 分组 / 卡片同源同时切换
+    const nextStalls = normalizeStalls(stallResult.value)
+    stalls.value = nextStalls
+    loadError.value = ''
+    loadedAt.value = new Date()
+
+    if (horseResult.status === 'fulfilled') {
+      horses.value = normalizeHorses(horseResult.value)
+      horseWarning.value = ''
+    } else {
+      horseWarning.value = reasonOf(horseResult.reason, '网络异常，请稍后重试')
+      ElMessage.error('马匹列表加载失败：' + horseWarning.value + '，栏位统计不受影响')
+    }
+    return true
+  } finally {
+    if (seq === loadSeq) {
+      loading.value = false
+    }
+  }
+}
+
+/** 手动刷新 / 错误条重试 */
+async function refresh() {
+  const ok = await load({ manual: true })
+  if (ok) ElMessage.success('看板已刷新')
+  return ok
+}
+
+async function withSaving(action) {
+  saving.value = true
+  try {
+    await action()
   } catch (error) {
-    ElMessage.error(error.message)
+    ElMessage.error(reasonOf(error, '操作失败'))
+  } finally {
+    saving.value = false
   }
 }
 
 async function submitStall() {
-  saving.value = true
-  try {
+  await withSaving(async () => {
     await api.createStall({
       stallNo: stallForm.stallNo,
       barnName: stallForm.barnName,
@@ -164,12 +372,9 @@ async function submitStall() {
     ElMessage.success('栏位已创建')
     stallDialog.value = false
     Object.assign(stallForm, { stallNo: '', barnName: '', areaSqm: null })
+    // 操作成功后自动刷新，重新走同一条一致性加载链路
     await load()
-  } catch (error) {
-    ElMessage.error(error.message)
-  } finally {
-    saving.value = false
-  }
+  })
 }
 
 function openOccupy(stall) {
@@ -181,17 +386,12 @@ function openOccupy(stall) {
 }
 
 async function submitOccupy() {
-  saving.value = true
-  try {
+  await withSaving(async () => {
     await api.occupyStall(occupyForm.id, occupyForm.horseId)
     ElMessage.success('入栏成功')
     occupyDialog.value = false
     await load()
-  } catch (error) {
-    ElMessage.error(error.message)
-  } finally {
-    saving.value = false
-  }
+  })
 }
 
 async function release(stall) {
@@ -200,7 +400,7 @@ async function release(stall) {
     ElMessage.success(`栏位 ${stall.stallNo} 已出栏`)
     await load()
   } catch (error) {
-    ElMessage.error(error.message)
+    ElMessage.error(reasonOf(error, '操作失败'))
   }
 }
 
@@ -210,7 +410,7 @@ async function toMaintenance(stall) {
     ElMessage.success(`栏位 ${stall.stallNo} 已转入维护`)
     await load()
   } catch (error) {
-    ElMessage.error(error.message)
+    ElMessage.error(reasonOf(error, '操作失败'))
   }
 }
 
@@ -220,14 +420,53 @@ async function restore(stall) {
     ElMessage.success(`栏位 ${stall.stallNo} 维护完成`)
     await load()
   } catch (error) {
-    ElMessage.error(error.message)
+    ElMessage.error(reasonOf(error, '操作失败'))
   }
 }
 
-onMounted(load)
+function tagOf(status) {
+  if (status === 'IDLE') return 'success'
+  if (status === 'OCCUPIED') return 'primary'
+  return 'warning'
+}
+
+onMounted(() => load())
 </script>
 
 <style scoped>
+.board__actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.board__alert {
+  margin-bottom: 12px;
+}
+
+.board__alert__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.board__warn {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  background: #fdf6ec;
+  border: 1px solid #f5e8d3;
+  border-radius: 8px;
+  color: #a07a45;
+}
+
+.board__empty {
+  margin-top: 28px;
+  background: #fff;
+  border: 1px dashed #e3d3cb;
+  border-radius: 12px;
+}
+
 .summary {
   display: flex;
   align-items: center;
