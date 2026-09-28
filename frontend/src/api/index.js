@@ -62,6 +62,8 @@ export const api = {
   changeHorseStatus: (id, status) => call(http.post(`/horses/${id}/status`, { status })),
 
   // 模块二：马房与栏位
+  // 看板快照：顶部汇总 / 马房分组 / 栏位明细由后端同一轮返回，页面整包替换
+  stallBoard: () => call(http.get('/stalls/board')),
   stalls: () => call(http.get('/stalls')),
   createStall: (body) => call(http.post('/stalls', body)),
   updateStall: (id, body) => call(http.put(`/stalls/${id}`, body)),

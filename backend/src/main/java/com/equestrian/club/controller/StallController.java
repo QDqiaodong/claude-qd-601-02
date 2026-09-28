@@ -13,10 +13,11 @@ import org.springframework.web.bind.annotation.RestController;
 import com.equestrian.club.common.ApiResponse;
 import com.equestrian.club.dto.OccupyRequest;
 import com.equestrian.club.dto.StallRequest;
+import com.equestrian.club.dto.view.StallBoardView;
 import com.equestrian.club.dto.view.StallView;
 import com.equestrian.club.service.StallService;
 
-/** 模块二（马房与栏位）：列表 / 新增 / 局部修改 / 入栏 / 出栏 / 维护 */
+/** 模块二（马房与栏位）：看板快照 / 列表 / 新增 / 局部修改 / 入栏 / 出栏 / 维护 */
 @RestController
 @RequestMapping("/api/stalls")
 public class StallController {
@@ -25,6 +26,15 @@ public class StallController {
 
     public StallController(StallService stallService) {
         this.stallService = stallService;
+    }
+
+    /**
+     * 看板快照：顶部汇总、马房分组、栏位明细在后端同一只读事务里一次算出。
+     * 前端整包替换展示状态，三处数字必然来自同一批数据。
+     */
+    @GetMapping("/board")
+    public ApiResponse<StallBoardView> board() {
+        return ApiResponse.success(stallService.board());
     }
 
     @GetMapping
